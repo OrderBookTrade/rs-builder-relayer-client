@@ -143,3 +143,14 @@ CONDITION_ID=0xabc... AMOUNT=1000000 cargo run --example split_merge
 - [Python SDK](https://github.com/Polymarket/py-builder-relayer-client)
 - [TypeScript SDK](https://github.com/Polymarket/builder-relayer-client)
 - [Contract Addresses](https://docs.polymarket.com/resources/contract-addresses)
+
+---
+
+## Donate
+
+If this SDK saved you time, consider buying me a coffee:
+
+**Ethereum / Polygon**
+```
+0xF4c6635dFfB53f21c500c1604EC284f8A8a7150D
+```
