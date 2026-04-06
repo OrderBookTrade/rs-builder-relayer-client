@@ -1,0 +1,389 @@
+use crate::auth::AuthMethod;
+use crate::builder::{create, derive, proxy, safe};
+use crate::contracts;
+use crate::error::{RelayerError, Result};
+use crate::types::*;
+use ethers::signers::{LocalWallet, Signer};
+use reqwest::Client;
+use std::sync::Arc;
+use tokio::time::{sleep, Duration};
+use tracing::{debug, info};
+
+const DEFAULT_GAS_LIMIT: u64 = 10_000_000;
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
+const MAX_POLL_ATTEMPTS: u32 = 100;
+
+/// Client for interacting with the Polymarket Builder Relayer.
+#[derive(Clone)]
+pub struct RelayClient {
+    http: Client,
+    base_url: String,
+    chain_id: u64,
+    signer: Arc<LocalWallet>,
+    auth: AuthMethod,
+    tx_type: RelayerTxType,
+}
+
+impl RelayClient {
+    /// Create a new RelayClient.
+    ///
+    /// # Arguments
+    /// * `chain_id` - Chain ID (137 for Polygon mainnet)
+    /// * `signer` - Ethers LocalWallet for signing transactions
+    /// * `auth` - Authentication method (Builder or RelayerKey)
+    /// * `tx_type` - Wallet type (Safe or Proxy)
+    pub async fn new(
+        chain_id: u64,
+        signer: LocalWallet,
+        auth: AuthMethod,
+        tx_type: RelayerTxType,
+    ) -> Result<Self> {
+        let http = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()?;
+
+        Ok(Self {
+            http,
+            base_url: contracts::RELAYER_URL.trim_end_matches('/').to_string(),
+            chain_id,
+            signer: Arc::new(signer),
+            auth,
+            tx_type,
+        })
+    }
+
+    /// Set a custom relayer URL.
+    pub fn set_url(&mut self, url: String) {
+        self.base_url = url.trim_end_matches('/').to_string();
+    }
+
+    /// Get the signer's EOA address.
+    pub fn signer_address(&self) -> ethers::types::Address {
+        self.signer.address()
+    }
+
+    /// Get the derived wallet address (Safe or Proxy).
+    pub fn wallet_address(&self) -> Result<ethers::types::Address> {
+        match self.tx_type {
+            RelayerTxType::Safe => derive::derive_safe_address(self.signer.address()),
+            RelayerTxType::Proxy => derive::derive_proxy_address(self.signer.address()),
+        }
+    }
+
+    /// Check if the Safe wallet is deployed.
+    pub async fn is_deployed(&self) -> Result<bool> {
+        let wallet = self.wallet_address()?;
+        let url = format!("{}/deployed?address={:?}", self.base_url, wallet);
+        let resp = self.http.get(&url).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RelayerError::Api { status, message: body });
+        }
+        let body: serde_json::Value = resp.json().await?;
+        Ok(body.as_bool().unwrap_or(false))
+    }
+
+    /// Get the current nonce for the signer.
+    pub async fn get_nonce(&self) -> Result<u64> {
+        let url = format!(
+            "{}/nonce?address={:?}&type={}",
+            self.base_url,
+            self.signer.address(),
+            self.tx_type.as_str()
+        );
+        let resp = self.http.get(&url).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RelayerError::Api { status, message: body });
+        }
+        let body: serde_json::Value = resp.json().await?;
+        let nonce = body
+            .as_u64()
+            .or_else(|| body.as_str().and_then(|s| s.parse().ok()))
+            .unwrap_or(0);
+        Ok(nonce)
+    }
+
+    /// Get relay payload (for Proxy transactions).
+    async fn get_relay_payload(&self) -> Result<RelayPayload> {
+        let url = format!(
+            "{}/relay-payload?address={:?}&type=PROXY",
+            self.base_url,
+            self.signer.address()
+        );
+        let resp = self.http.get(&url).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RelayerError::Api { status, message: body });
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// Get a transaction's status by ID.
+    pub async fn get_transaction(&self, tx_id: &str) -> Result<TxResult> {
+        let url = format!("{}/transaction?id={}", self.base_url, tx_id);
+        let resp = self.http.get(&url).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(RelayerError::Api { status, message: body });
+        }
+        let data: RelayerTransactionResponse = resp.json().await?;
+        let state = match data.state.to_uppercase().as_str() {
+            "NEW" => TxState::New,
+            "EXECUTED" => TxState::Executed,
+            "MINED" => TxState::Mined,
+            "CONFIRMED" => TxState::Confirmed,
+            "FAILED" => TxState::Failed,
+            "INVALID" => TxState::Invalid,
+            _ => TxState::New,
+        };
+        Ok(TxResult {
+            state,
+            tx_hash: data.transaction_hash.or(data.hash),
+            proxy_address: None,
+            error: None,
+        })
+    }
+
+    /// Deploy a Safe wallet (one-time, Safe wallet type only).
+    pub async fn deploy(&self) -> Result<TxResult> {
+        if self.tx_type != RelayerTxType::Safe {
+            return Err(RelayerError::Other(
+                "deploy() is only for Safe wallet type".to_string(),
+            ));
+        }
+
+        if self.is_deployed().await? {
+            let wallet = self.wallet_address()?;
+            return Err(RelayerError::WalletAlreadyDeployed(format!("{:?}", wallet)));
+        }
+
+        let safe_address = self.wallet_address()?;
+        let (signature, params) =
+            create::build_create_transaction(self.signer.as_ref(), self.chain_id).await?;
+
+        let request = TransactionRequest {
+            tx_type: "SAFE-CREATE".to_string(),
+            from: format!("{:?}", self.signer.address()),
+            to: contracts::SAFE_FACTORY.to_string(),
+            proxy_wallet: Some(format!("{:?}", safe_address)),
+            data: "0x".to_string(),
+            signature,
+            nonce: None,
+            signature_params: serde_json::to_value(&params)
+                .map_err(|e| RelayerError::Abi(e.to_string()))?,
+            metadata: Some("Deploy Safe wallet".to_string()),
+            value: Some("0".to_string()),
+        };
+
+        let response = self.submit(request).await?;
+        info!(tx_id = %response.transaction_id, "Safe deploy submitted");
+
+        let result = self.wait_for_tx(&response.transaction_id).await?;
+        Ok(TxResult {
+            proxy_address: Some(format!("{:?}", safe_address)),
+            ..result
+        })
+    }
+
+    /// Execute one or more transactions through the relayer.
+    pub async fn execute(
+        &self,
+        txs: Vec<Transaction>,
+        description: &str,
+    ) -> Result<TransactionResponseHandle> {
+        if txs.is_empty() {
+            return Err(RelayerError::Other("No transactions to execute".to_string()));
+        }
+
+        let request = match self.tx_type {
+            RelayerTxType::Safe => self.build_safe_request(&txs, description).await?,
+            RelayerTxType::Proxy => self.build_proxy_request(&txs, description).await?,
+        };
+
+        let response = self.submit(request).await?;
+        info!(tx_id = %response.transaction_id, description, "Transaction submitted");
+
+        Ok(TransactionResponseHandle {
+            tx_id: response.transaction_id,
+            client: self.clone(),
+        })
+    }
+
+    /// Build a Safe transaction request with full EIP-712 signing.
+    async fn build_safe_request(
+        &self,
+        txs: &[Transaction],
+        metadata: &str,
+    ) -> Result<TransactionRequest> {
+        let safe_address = self.wallet_address()?;
+
+        if !self.is_deployed().await? {
+            return Err(RelayerError::WalletNotDeployed(format!("{:?}", safe_address)));
+        }
+
+        let nonce = self.get_nonce().await?;
+
+        let (data, to, signature, sig_params) = safe::build_safe_transaction(
+            self.signer.as_ref(),
+            self.chain_id,
+            safe_address,
+            txs,
+            nonce,
+        )
+        .await?;
+
+        Ok(TransactionRequest {
+            tx_type: "SAFE".to_string(),
+            from: format!("{:?}", self.signer.address()),
+            to: format!("{:?}", to),
+            proxy_wallet: Some(format!("{:?}", safe_address)),
+            data,
+            signature,
+            nonce: Some(nonce.to_string()),
+            signature_params: serde_json::to_value(&sig_params)
+                .map_err(|e| RelayerError::Abi(e.to_string()))?,
+            metadata: Some(metadata.to_string()),
+            value: Some("0".to_string()),
+        })
+    }
+
+    /// Build a Proxy transaction request with keccak256 signing.
+    async fn build_proxy_request(
+        &self,
+        txs: &[Transaction],
+        metadata: &str,
+    ) -> Result<TransactionRequest> {
+        let proxy_address = self.wallet_address()?;
+        let relay_payload = self.get_relay_payload().await?;
+
+        let (data, signature, sig_params) = proxy::build_proxy_transaction(
+            self.signer.as_ref(),
+            self.signer.address(),
+            txs,
+            &relay_payload,
+            DEFAULT_GAS_LIMIT,
+        )
+        .await?;
+
+        Ok(TransactionRequest {
+            tx_type: "PROXY".to_string(),
+            from: format!("{:?}", self.signer.address()),
+            to: contracts::PROXY_FACTORY.to_string(),
+            proxy_wallet: Some(format!("{:?}", proxy_address)),
+            data,
+            signature,
+            nonce: Some(relay_payload.nonce),
+            signature_params: serde_json::to_value(&sig_params)
+                .map_err(|e| RelayerError::Abi(e.to_string()))?,
+            metadata: Some(metadata.to_string()),
+            value: Some("0".to_string()),
+        })
+    }
+
+    /// Submit a transaction request to the relayer.
+    async fn submit(&self, request: TransactionRequest) -> Result<RelayerTransactionResponse> {
+        let url = format!("{}/submit", self.base_url);
+        let body = serde_json::to_string(&request)
+            .map_err(|e| RelayerError::Abi(e.to_string()))?;
+
+        let auth_headers = self.auth.headers("POST", "/submit", &body)?;
+
+        let resp = self
+            .http
+            .post(&url)
+            .headers(auth_headers)
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let err = resp.text().await.unwrap_or_default();
+            return Err(RelayerError::Api { status, message: err });
+        }
+
+        Ok(resp.json().await?)
+    }
+
+    /// Poll for transaction confirmation.
+    async fn wait_for_tx(&self, tx_id: &str) -> Result<TxResult> {
+        for attempt in 0..MAX_POLL_ATTEMPTS {
+            sleep(POLL_INTERVAL).await;
+            let result = self.get_transaction(tx_id).await?;
+            debug!(attempt, state = ?result.state, tx_id, "Polling transaction");
+
+            if result.state.is_terminal() {
+                if result.state == TxState::Failed {
+                    return Err(RelayerError::TransactionFailed(format!(
+                        "Transaction {} failed",
+                        tx_id
+                    )));
+                }
+                if result.state == TxState::Invalid {
+                    return Err(RelayerError::TransactionInvalid(format!(
+                        "Transaction {} rejected",
+                        tx_id
+                    )));
+                }
+                return Ok(result);
+            }
+        }
+        Err(RelayerError::Timeout)
+    }
+
+    // ── Convenience methods ──
+
+    /// Approve USDC.e for CTF Exchange.
+    pub async fn approve_usdc_for_ctf(&self) -> Result<TransactionResponseHandle> {
+        let tx = crate::operations::approve_usdc_for_ctf_exchange();
+        self.execute(vec![tx], "Approve USDC for CTF Exchange").await
+    }
+
+    /// Approve USDC.e for Neg Risk CTF Exchange.
+    pub async fn approve_usdc_for_negrisk(&self) -> Result<TransactionResponseHandle> {
+        let tx = crate::operations::approve_usdc_for_neg_risk_exchange();
+        self.execute(vec![tx], "Approve USDC for NegRisk Exchange").await
+    }
+
+    /// Approve CTF tokens (ERC1155) for CTF Exchange.
+    pub async fn approve_ctf_for_exchange(&self) -> Result<TransactionResponseHandle> {
+        let tx = crate::operations::approve_ctf_for_ctf_exchange();
+        self.execute(vec![tx], "Approve CTF for Exchange").await
+    }
+
+    /// Set up all standard approvals in a single batch.
+    pub async fn setup_approvals(&self) -> Result<TransactionResponseHandle> {
+        let txs = vec![
+            crate::operations::approve_usdc_for_ctf_exchange(),
+            crate::operations::approve_usdc_for_neg_risk_exchange(),
+            crate::operations::approve_ctf_for_ctf_exchange(),
+            crate::operations::approve_ctf_for_neg_risk_exchange(),
+            crate::operations::approve_ctf_for_neg_risk_adapter(),
+        ];
+        self.execute(txs, "Setup all approvals").await
+    }
+}
+
+/// Handle for a submitted transaction, with polling support.
+pub struct TransactionResponseHandle {
+    pub tx_id: String,
+    client: RelayClient,
+}
+
+impl TransactionResponseHandle {
+    /// Poll the transaction until it reaches a terminal state.
+    pub async fn wait(self) -> Result<TxResult> {
+        self.client.wait_for_tx(&self.tx_id).await
+    }
+
+    /// Get the transaction ID.
+    pub fn id(&self) -> &str {
+        &self.tx_id
+    }
+}
