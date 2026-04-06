@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 keywords = ["polymarket", "relayer", "gasless", "ethereum", "polygon"]
 categories = ["api-bindings"]
+repository = "https://github.com/OrderBookTrade/rs-builder-relayer-client"
 
 [lib]
 name = "polymarket_relayer"

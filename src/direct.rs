@@ -37,6 +37,7 @@ pub struct DirectExecutor {
     provider: SignerMiddleware<Provider<Http>, LocalWallet>,
     signer_address: Address,
     safe_address: Address,
+    #[allow(dead_code)]
     chain_id: u64,
 }
 
