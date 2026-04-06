@@ -9,6 +9,9 @@ readme = "README.md"
 keywords = ["polymarket", "relayer", "gasless", "ethereum", "polygon"]
 categories = ["api-bindings"]
 
+[lib]
+name = "polymarket_relayer"
+
 [dependencies]
 reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
@@ -26,6 +29,10 @@ url = "2"
 [dev-dependencies]
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }
+polymarket-client-sdk = { version = "0.4", features = ["data"] }
+rust_decimal = "1.36"
+dotenvy = "0.15"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [[example]]
 name = "setup_wallet"

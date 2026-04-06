@@ -6,23 +6,27 @@ Claim your winnings, approve tokens, split/merge positions — all without payin
 
 ```toml
 [dependencies]
-polymarket-relayer = { git = "https://github.com/youruser/rs-builder-relayer-client" }
+polymarket-relayer = "0.1"
+polymarket-client-sdk = { version = "0.4", features = ["data"] }
+ethers = { version = "2", features = ["abigen"] }
+tokio = { version = "1", features = ["full"] }
 ```
 
 ---
 
-## Quick Start — Claim All Settled Positions
+## Quick Start — Scan & Redeem All Settled Positions
 
 ```rust
-use polymarket_relayer::{RelayClient, AuthMethod, RelayerTxType, operations};
 use ethers::signers::LocalWallet;
+use polymarket_client_sdk::data::Client as DataClient;
+use polymarket_client_sdk::data::types::request::PositionsRequest;
+use polymarket_relayer::{operations, AuthMethod, RelayClient, RelayerTxType};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let wallet: LocalWallet = std::env::var("PRIVATE_KEY")?.parse()?;
-
     let client = RelayClient::new(
-        137,  // Polygon mainnet
+        137,
         wallet,
         AuthMethod::relayer_key(
             &std::env::var("POLY_RELAYER_API_KEY")?,
@@ -31,21 +35,39 @@ async fn main() -> anyhow::Result<()> {
         RelayerTxType::Safe,
     ).await?;
 
-    // Get your settled positions from the CLOB API, then redeem them all in one batch:
-    let condition_ids: Vec<[u8; 32]> = vec![/* from API */];
+    // Step 1: Query all your positions from the Polymarket Data API
+    let data = DataClient::default();
+    let positions = data.positions(
+        &PositionsRequest::builder()
+            .user(std::env::var("POLY_RELAYER_ADDRESS")?.parse()?)
+            .limit(500)?
+            .build(),
+    ).await?;
 
-    let txs: Vec<_> = condition_ids.iter()
-        .map(|&id| operations::redeem_regular(id, &[1, 2]))
-        .collect();
+    // Step 2: Filter settled positions, build redeem txs
+    let mut seen = std::collections::HashSet::new();
+    for pos in positions.iter().filter(|p| p.redeemable) {
+        let cid = pos.condition_id;
+        if !seen.insert(cid) { continue; }  // one redeem per condition_id
 
-    let result = client.execute(txs, "Redeem all").await?.wait().await?;
-    println!("✅ Claimed! tx: {}", result.tx_hash.unwrap_or_default());
+        let tx = if pos.negative_risk {
+            operations::redeem_neg_risk_positions(cid, &[1, 2])
+        } else {
+            operations::redeem_regular(cid, &[1, 2])
+        };
+
+        // Step 3: Redeem gaslessly through the relayer
+        let result = client.execute(vec![tx], &pos.title).await?.wait().await?;
+        println!("{} | tx: {}", pos.title, result.tx_hash.unwrap_or_default());
+    }
 
     Ok(())
 }
 ```
 
-Get your **Relayer API key** at [polymarket.com/settings](https://polymarket.com/settings) → API Keys.
+That's it. Scan your positions, redeem them all, pay zero gas.
+
+Get your **Relayer API key** at [polymarket.com/settings](https://polymarket.com/settings) > API Keys.
 
 ---
 
@@ -71,8 +93,8 @@ client.setup_approvals().await?.wait().await?;
 | Set all token approvals | `client.setup_approvals()` |
 | Redeem regular position | `operations::redeem_regular(condition_id, &[1, 2])` |
 | Redeem neg-risk position | `operations::redeem_neg_risk_positions(condition_id, &[1, 2])` |
-| Split USDC → outcome tokens | `operations::split_regular(condition_id, &[1, 2], amount)` |
-| Merge outcome tokens → USDC | `operations::merge_regular(condition_id, &[1, 2], amount)` |
+| Split USDC into outcome tokens | `operations::split_regular(condition_id, &[1, 2], amount)` |
+| Merge outcome tokens back to USDC | `operations::merge_regular(condition_id, &[1, 2], amount)` |
 | Approve USDC for CTF Exchange | `operations::approve_usdc_for_ctf_exchange()` |
 | Batch multiple operations | `client.execute(vec![tx1, tx2, tx3], "desc")` |
 
@@ -82,7 +104,7 @@ client.setup_approvals().await?.wait().await?;
 
 ### Option A: Relayer API Key (recommended for most users)
 
-Get your key at [polymarket.com/settings](https://polymarket.com/settings) → API Keys.
+Get your key at [polymarket.com/settings](https://polymarket.com/settings) > API Keys.
 
 ```rust
 AuthMethod::relayer_key("your_api_key", "your_eoa_address")
@@ -115,8 +137,9 @@ PRIVATE_KEY=0x... POLY_RELAYER_API_KEY=... POLY_RELAYER_ADDRESS=0x... \
 # 2. Redeem a specific position
 CONDITION_ID=0xabc... cargo run --example redeem_single
 
-# 3. Batch redeem multiple positions
+# 3. Scan ALL positions + redeem everything settled (dry-run first)
 cargo run --example redeem_all
+cargo run --example redeem_all -- --execute
 
 # 4. Split and merge positions
 CONDITION_ID=0xabc... AMOUNT=1000000 cargo run --example split_merge
