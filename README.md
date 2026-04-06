@@ -2,6 +2,61 @@
 
 Rust SDK for [Polymarket's gasless relayer](https://docs.polymarket.com/trading/gasless). Redeem positions, approve tokens, split/merge — zero gas.
 
+## 30-Second Quickstart
+
+```bash
+cargo new my-redeemer && cd my-redeemer
+cargo add rs-builder-relayer-client ethers tokio --features tokio/full
+cargo add anyhow dotenvy hex
+```
+
+Create `.env`:
+```
+PRIVATE_KEY=0x...
+BUILDER_KEY=...
+BUILDER_SECRET=...
+BUILDER_PASSPHRASE=...
+```
+
+`src/main.rs`:
+```rust
+use polymarket_relayer::{RelayClient, AuthMethod, RelayerTxType};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
+    let wallet = std::env::var("PRIVATE_KEY")?.parse()?;
+    let client = RelayClient::new(
+        137, wallet,
+        AuthMethod::builder(
+            &std::env::var("BUILDER_KEY")?,
+            &std::env::var("BUILDER_SECRET")?,
+            &std::env::var("BUILDER_PASSPHRASE")?,
+        ),
+        RelayerTxType::Safe,
+    ).await?;
+
+    client.setup_approvals().await?.wait().await?;
+    println!("Done. You can now trade gaslessly.");
+    Ok(())
+}
+```
+
+```bash
+cargo run
+```
+
+## Getting Your Credentials
+
+| Credential | Where |
+|---|---|
+| `PRIVATE_KEY` | Your Polygon wallet private key (MetaMask > Account Details > Export) |
+| Relayer API key | [polymarket.com/settings > Relayer API Keys](https://polymarket.com/settings) (anyone) |
+
+No Builder keys? Use `AuthMethod::relayer_key("key", "address")` instead — same features, simpler setup.
+
+---
+
 ## Install
 
 ```toml
@@ -9,31 +64,42 @@ Rust SDK for [Polymarket's gasless relayer](https://docs.polymarket.com/trading/
 rs-builder-relayer-client = "0.1"
 ethers = "2"
 tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+dotenvy = "0.15"
+hex = "0.4"
 ```
 
-## Usage
+## Redeem Example
+
+Add `CONDITION_ID=0x...` to your `.env`, then:
 
 ```rust
-use polymarket_relayer::{operations, AuthMethod, RelayClient, RelayerTxType};
+use polymarket_relayer::{AuthMethod, RelayClient, RelayerTxType, operations};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
+
     let wallet = std::env::var("PRIVATE_KEY")?.parse()?;
     let client = RelayClient::new(
         137,
         wallet,
-        AuthMethod::builder("key", "secret", "passphrase"),
+        AuthMethod::builder(
+            &std::env::var("BUILDER_KEY")?,
+            &std::env::var("BUILDER_SECRET")?,
+            &std::env::var("BUILDER_PASSPHRASE")?,
+        ),
         RelayerTxType::Safe,
     ).await?;
 
-    // Redeem a settled position (gasless)
-    let condition_id = hex::decode("ab12...cd34")?;  // 32 bytes
+    let condition_id_hex = std::env::var("CONDITION_ID")?;
+    let condition_id_bytes = hex::decode(condition_id_hex.trim_start_matches("0x"))?;
     let mut cid = [0u8; 32];
-    cid.copy_from_slice(&condition_id);
+    cid.copy_from_slice(&condition_id_bytes);
 
     let tx = operations::redeem_regular(cid, &[1, 2]);
     let result = client.execute(vec![tx], "Redeem").await?.wait().await?;
-    println!("tx: {}", result.tx_hash.unwrap_or_default());
+    println!("Transaction Hash: {:?}", result.tx_hash);
 
     Ok(())
 }
