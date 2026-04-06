@@ -2,6 +2,7 @@ pub mod auth;
 pub mod builder;
 pub mod client;
 pub mod contracts;
+pub mod direct;
 pub mod error;
 pub mod operations;
 pub mod types;
@@ -9,6 +10,7 @@ pub mod types;
 // Re-export key types for convenience.
 pub use auth::{AuthMethod, BuilderConfig};
 pub use client::{RelayClient, TransactionResponseHandle};
+pub use direct::{DirectExecutor, DirectTxResult};
 pub use error::{RelayerError, Result};
 pub use operations::{
     approve, approve_ctf_for_ctf_exchange, approve_ctf_for_neg_risk_adapter,

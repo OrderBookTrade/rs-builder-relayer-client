@@ -1,7 +1,8 @@
-//! Scan all positions via the Polymarket Data API, then gaslessly redeem
-//! every settled position through the Builder Relayer — no gas needed.
+//! Scan all positions via the Polymarket Data API, then redeem settled ones.
 //!
-//! This is the killer use-case: one command to claim all your winnings.
+//! Two modes (auto-detected, matches the Python redeem service):
+//!   - GASLESS via Polymarket relayer (needs BUILDER_KEY, no MATIC needed)
+//!   - DIRECT on-chain via GnosisSafe  (fallback on 429, needs MATIC for gas)
 //!
 //! Usage:
 //!   cargo run --example redeem_all                 # dry-run (default)
@@ -9,16 +10,23 @@
 //!
 //! Required env vars (or .env file):
 //!   PRIVATE_KEY=0x...
-//!   POLY_RELAYER_API_KEY=...
-//!   POLY_RELAYER_ADDRESS=0x...     # your Safe/proxy wallet address
+//!   POLY_RELAYER_ADDRESS=0x...          # your Safe wallet address
+//!   BUILDER_KEY=...                     # Builder HMAC key
+//!   BUILDER_SECRET=...                  # Builder HMAC secret (base64)
+//!   BUILDER_PASSPHRASE=...              # Builder HMAC passphrase
+//!   POLYGON_RPC_URL=https://...         # (optional, for direct fallback)
 
 use ethers::signers::LocalWallet;
 use polymarket_client_sdk::data::Client as DataClient;
 use polymarket_client_sdk::data::types::request::PositionsRequest;
-use polymarket_relayer::{operations, AuthMethod, RelayClient, RelayerTxType};
+use polymarket_relayer::{
+    operations, AuthMethod, DirectExecutor, RelayClient, RelayerError, RelayerTxType, Transaction,
+};
 use rust_decimal::Decimal;
 use std::collections::HashSet;
 use std::env;
+
+const DEFAULT_RPC: &str = "https://polygon-rpc.com";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -33,18 +41,41 @@ async fn main() -> anyhow::Result<()> {
 
     let execute = env::args().any(|a| a == "--execute");
 
-    let private_key = env::var("PRIVATE_KEY")?;
-    let api_key = env::var("POLY_RELAYER_API_KEY")?;
-    let wallet_address = env::var("POLY_RELAYER_ADDRESS")?;
+    let private_key = env::var("PRIVATE_KEY")
+        .map_err(|_| anyhow::anyhow!("Missing PRIVATE_KEY in .env"))?;
+    let wallet_address = env::var("POLY_RELAYER_ADDRESS")
+        .map_err(|_| anyhow::anyhow!("Missing POLY_RELAYER_ADDRESS in .env"))?;
+    let rpc_url = env::var("POLYGON_RPC_URL").unwrap_or_else(|_| DEFAULT_RPC.to_string());
 
-    // ── 1. Build the gasless relayer client ──────────────────────────────
+    // ── 1. Build clients ────────────────────────────────────────────────
+    // Relayer client (gasless) + direct executor (fallback, needs MATIC)
+
+    let auth = if let (Ok(key), Ok(secret), Ok(pass)) = (
+        env::var("BUILDER_KEY"),
+        env::var("BUILDER_SECRET"),
+        env::var("BUILDER_PASSPHRASE"),
+    ) {
+        println!("Auth:   Builder (HMAC) — gasless mode, direct fallback ready");
+        AuthMethod::builder(&key, &secret, &pass)
+    } else if let Ok(api_key) = env::var("POLY_RELAYER_API_KEY") {
+        println!("Auth:   Relayer key — gasless mode, direct fallback ready");
+        AuthMethod::relayer_key(&api_key, &wallet_address)
+    } else {
+        anyhow::bail!(
+            "Set BUILDER_KEY/SECRET/PASSPHRASE or POLY_RELAYER_API_KEY in .env"
+        );
+    };
 
     let wallet: LocalWallet = private_key.parse()?;
-    let auth = AuthMethod::relayer_key(&api_key, &wallet_address);
-    let client = RelayClient::new(137, wallet, auth, RelayerTxType::Safe).await?;
+    let client = RelayClient::new(137, wallet.clone(), auth, RelayerTxType::Safe).await?;
+
+    // Direct executor for on-chain fallback when relayer returns 429
+    let direct = DirectExecutor::new(&rpc_url, wallet, 137)?;
+    let matic_balance = direct.get_matic_balance().await.unwrap_or(0.0);
 
     println!("EOA:    {:?}", client.signer_address());
     println!("Safe:   {:?}", client.wallet_address()?);
+    println!("MATIC:  {:.4} (for direct fallback)", matic_balance);
 
     // ── 2. Fetch all positions via Polymarket Data API ──────────────────
 
@@ -143,16 +174,14 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // ── 4. Redeem each settled condition via the gasless relayer ─────────
-    //
-    // Deduplicate by condition_id (both YES and NO share the same one).
-    // Each redeem is a separate relayer call (the relayer pays gas).
+    // ── 4. Redeem: try relayer first, fallback to direct on 429 ─────────
 
-    println!("=== EXECUTING GASLESS REDEMPTIONS ===\n");
+    println!("=== EXECUTING REDEMPTIONS ===\n");
 
     let mut redeemed_ids = HashSet::new();
     let mut success_count = 0u32;
     let mut fail_count = 0u32;
+    let mut total_gas_matic = 0.0f64;
 
     for pos in &redeemable {
         let cid = format!("0x{}", hex::encode(pos.condition_id));
@@ -166,8 +195,6 @@ async fn main() -> anyhow::Result<()> {
         let won = pos.cur_price >= Decimal::new(95, 2);
         let contract_label = if pos.negative_risk { "NegRisk" } else { "CTF" };
 
-        // Build the right redeem transaction
-        // condition_id is FixedBytes<32> from alloy — deref to [u8; 32]
         let cid_bytes: [u8; 32] = *pos.condition_id;
         let tx = if pos.negative_risk {
             operations::redeem_neg_risk_positions(cid_bytes, &[1, 2])
@@ -175,31 +202,57 @@ async fn main() -> anyhow::Result<()> {
             operations::redeem_regular(cid_bytes, &[1, 2])
         };
 
-        // Submit through the gasless relayer
-        match client.execute(vec![tx], &format!("Redeem: {}", pos.title)).await {
-            Ok(handle) => {
-                let tx_id = handle.id().to_string();
-                match handle.wait().await {
-                    Ok(result) => {
-                        let usdc_label = if won {
-                            format!("+${:.2}", pos.size)
-                        } else {
-                            "$0.00".to_string()
-                        };
-                        println!(
-                            "  [OK]   \"{}\" | {} | {} | tx: {}",
-                            title,
-                            usdc_label,
-                            contract_label,
-                            short_hash(&result.tx_hash.unwrap_or(tx_id)),
-                        );
-                        success_count += 1;
-                    }
-                    Err(e) => {
-                        println!("  [FAIL] \"{}\" | {}", title, e);
-                        fail_count += 1;
-                    }
-                }
+        let usdc_label = if won {
+            format!("+${:.2}", pos.size)
+        } else {
+            "$0.00".to_string()
+        };
+
+        // Try gasless relayer first
+        match try_relayer(&client, &tx, &pos.title).await {
+            Ok(tx_hash) => {
+                println!(
+                    "  [OK]   \"{}\" | {} | {} | gasless | tx: {}",
+                    title, usdc_label, contract_label, short_hash(&tx_hash),
+                );
+                success_count += 1;
+                continue;
+            }
+            Err(RelayerError::QuotaExhausted) => {
+                println!(
+                    "  [429]  \"{}\" | Relayer quota hit — falling back to direct",
+                    title
+                );
+            }
+            Err(e) => {
+                println!(
+                    "  [WARN] \"{}\" | Relayer error: {} — trying direct",
+                    title, e
+                );
+            }
+        }
+
+        // Fallback: direct on-chain via Safe
+        match direct.execute(&tx).await {
+            Ok(result) if result.success => {
+                total_gas_matic += result.gas_cost_matic;
+                println!(
+                    "  [OK]   \"{}\" | {} | {} | direct | gas: {:.5} MATIC | tx: {}",
+                    title,
+                    usdc_label,
+                    contract_label,
+                    result.gas_cost_matic,
+                    short_hash(&result.tx_hash),
+                );
+                success_count += 1;
+            }
+            Ok(result) => {
+                println!(
+                    "  [FAIL] \"{}\" | reverted | tx: {}",
+                    title,
+                    short_hash(&result.tx_hash)
+                );
+                fail_count += 1;
             }
             Err(e) => {
                 println!("  [FAIL] \"{}\" | {}", title, e);
@@ -219,9 +272,25 @@ async fn main() -> anyhow::Result<()> {
         println!("Failed:   {fail_count}");
     }
     println!("Expected USDC recovered: ~${:.2}", expected_usdc);
-    println!("Gas cost: $0.00 (gasless!)");
+    if total_gas_matic > 0.0 {
+        println!("Gas spent (direct):     ~{:.6} MATIC", total_gas_matic);
+    }
 
     Ok(())
+}
+
+/// Try to execute via the gasless relayer. Returns tx hash on success.
+async fn try_relayer(
+    client: &RelayClient,
+    tx: &Transaction,
+    description: &str,
+) -> polymarket_relayer::Result<String> {
+    let handle = client
+        .execute(vec![tx.clone()], &format!("Redeem: {}", description))
+        .await?;
+    let tx_id = handle.id().to_string();
+    let result = handle.wait().await?;
+    Ok(result.tx_hash.unwrap_or(tx_id))
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────

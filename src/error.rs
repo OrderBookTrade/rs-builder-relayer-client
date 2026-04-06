@@ -38,6 +38,9 @@ pub enum RelayerError {
     #[error("Auth error: {0}")]
     AuthError(String),
 
+    #[error("Relayer quota exhausted (429)")]
+    QuotaExhausted,
+
     #[error("{0}")]
     Other(String),
 }

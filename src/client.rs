@@ -81,7 +81,14 @@ impl RelayClient {
             return Err(RelayerError::Api { status, message: body });
         }
         let body: serde_json::Value = resp.json().await?;
-        Ok(body.as_bool().unwrap_or(false))
+        // Handle multiple response formats:
+        //   true / false                → bare bool
+        //   "true" / "false"            → string
+        //   {"deployed": true}          → object
+        Ok(body.as_bool()
+            .or_else(|| body.as_str().map(|s| s == "true"))
+            .or_else(|| body.get("deployed").and_then(|v| v.as_bool()))
+            .unwrap_or(false))
     }
 
     /// Get the current nonce for the signer.
@@ -222,9 +229,8 @@ impl RelayClient {
     ) -> Result<TransactionRequest> {
         let safe_address = self.wallet_address()?;
 
-        if !self.is_deployed().await? {
-            return Err(RelayerError::WalletNotDeployed(format!("{:?}", safe_address)));
-        }
+        // Don't block on is_deployed() — the relayer will reject if not deployed.
+        // This matches the Python SDK behavior.
 
         let nonce = self.get_nonce().await?;
 
@@ -291,7 +297,14 @@ impl RelayClient {
         let body = serde_json::to_string(&request)
             .map_err(|e| RelayerError::Abi(e.to_string()))?;
 
+        debug!(url = %url, body_len = body.len(), "Submitting to relayer");
+
         let auth_headers = self.auth.headers("POST", "/submit", &body)?;
+
+        debug!(
+            headers = ?auth_headers.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
+            "Auth headers"
+        );
 
         let resp = self
             .http
@@ -305,6 +318,9 @@ impl RelayClient {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let err = resp.text().await.unwrap_or_default();
+            if status == 429 {
+                return Err(RelayerError::QuotaExhausted);
+            }
             return Err(RelayerError::Api { status, message: err });
         }
 
