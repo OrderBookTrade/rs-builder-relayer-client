@@ -16,6 +16,8 @@ PRIVATE_KEY=0x...
 BUILDER_KEY=...
 BUILDER_SECRET=...
 BUILDER_PASSPHRASE=...
+# Optional: Use Alchemy or QuickNode for Direct Fallback. Default polygon-rpc.com is unstable.
+POLYGON_RPC_URL=https://...
 ```
 
 `src/main.rs`:
@@ -130,10 +132,13 @@ AuthMethod::relayer_key("api_key", "wallet_address")
 
 ## Direct Fallback (when relayer returns 429)
 
+> **Note:** The default `https://polygon-rpc.com/` RPC often experiences TLS handshake EOF issues. For reliable fallback execution, it is highly recommended to provide a `POLYGON_RPC_URL` from providers like Alchemy, QuickNode, or LlamaRPC.
+
 ```rust
 use polymarket_relayer::{DirectExecutor, RelayerError};
 
-let direct = DirectExecutor::new("https://polygon-rpc.com", wallet, 137)?;
+let rpc_url = std::env::var("POLYGON_RPC_URL").unwrap_or_else(|_| "https://polygon-rpc.com".to_string());
+let direct = DirectExecutor::new(&rpc_url, wallet, 137)?;
 
 match client.execute(vec![tx], "Redeem").await {
     Err(RelayerError::QuotaExhausted) => {

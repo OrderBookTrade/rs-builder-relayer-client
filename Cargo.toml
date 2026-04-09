@@ -1,6 +1,6 @@
 [package]
 name = "rs-builder-relayer-client"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["baice <libaice147@gmail.com>"]
 edition = "2021"
 description = "A Rust SDK for Polymarket's Builder Relayer — gasless on-chain operations"
