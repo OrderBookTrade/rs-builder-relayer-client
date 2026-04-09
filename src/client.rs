@@ -80,7 +80,9 @@ impl RelayClient {
             let body = resp.text().await.unwrap_or_default();
             return Err(RelayerError::Api { status, message: body });
         }
-        let body: serde_json::Value = resp.json().await?;
+        let text = resp.text().await?;
+        let body: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| RelayerError::Other(format!("Parse Error on {}: {}", text, e)))?;
         // Handle multiple response formats:
         //   true / false                → bare bool
         //   "true" / "false"            → string
@@ -105,7 +107,9 @@ impl RelayClient {
             let body = resp.text().await.unwrap_or_default();
             return Err(RelayerError::Api { status, message: body });
         }
-        let body: serde_json::Value = resp.json().await?;
+        let text = resp.text().await?;
+        let body: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| RelayerError::Other(format!("Parse Error on {}: {}", text, e)))?;
         let nonce = body
             .as_u64()
             .or_else(|| body.as_str().and_then(|s| s.parse().ok()))
@@ -126,7 +130,8 @@ impl RelayClient {
             let body = resp.text().await.unwrap_or_default();
             return Err(RelayerError::Api { status, message: body });
         }
-        Ok(resp.json().await?)
+        let text = resp.text().await?;
+        Ok(serde_json::from_str(&text).map_err(|e| RelayerError::Other(format!("Payload Parse Error on {}: {}", text, e)))?)
     }
 
     /// Get a transaction's status by ID.
@@ -138,7 +143,8 @@ impl RelayClient {
             let body = resp.text().await.unwrap_or_default();
             return Err(RelayerError::Api { status, message: body });
         }
-        let data: RelayerTransactionResponse = resp.json().await?;
+        let text = resp.text().await?;
+        let data: RelayerTransactionResponse = serde_json::from_str(&text).map_err(|e| RelayerError::Other(format!("Tx Parse Error on {}: {}", text, e)))?;
         let state = match data.state.to_uppercase().as_str() {
             "NEW" => TxState::New,
             "EXECUTED" => TxState::Executed,
@@ -324,7 +330,8 @@ impl RelayClient {
             return Err(RelayerError::Api { status, message: err });
         }
 
-        Ok(resp.json().await?)
+        let text = resp.text().await?;
+        Ok(serde_json::from_str(&text).map_err(|e| RelayerError::Other(format!("Submit Parse Error on {}: {}", text, e)))?)
     }
 
     /// Poll for transaction confirmation.
