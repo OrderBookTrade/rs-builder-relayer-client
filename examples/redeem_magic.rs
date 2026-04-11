@@ -61,7 +61,8 @@ async fn main() -> anyhow::Result<()> {
         &env::var("BUILDER_PASSPHRASE").map_err(|_| anyhow::anyhow!("Missing BUILDER_PASSPHRASE"))?,
     );
 
-    let client = RelayClient::new(137, wallet.clone(), auth, RelayerTxType::Proxy).await?;
+    let mut client = RelayClient::new(137, wallet.clone(), auth, RelayerTxType::Proxy).await?;
+    client.set_rpc_url(rpc_url.clone());
 
     // Direct executor (proxy mode) for fallback
     let direct = DirectExecutor::new_proxy_with_address(&rpc_url, wallet, 137, proxy_address)?;

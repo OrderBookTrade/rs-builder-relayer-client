@@ -28,7 +28,7 @@ use polymarket_relayer::{RelayClient, AuthMethod, RelayerTxType};
 async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     let wallet = std::env::var("PRIVATE_KEY")?.parse()?;
-    let client = RelayClient::new(
+    let mut client = RelayClient::new(
         137, wallet,
         AuthMethod::builder(
             &std::env::var("BUILDER_KEY")?,
@@ -37,6 +37,11 @@ async fn main() -> anyhow::Result<()> {
         ),
         RelayerTxType::Safe,
     ).await?;
+
+    // Read nonce from on-chain (avoids stale relayer API nonce → GS026)
+    if let Ok(rpc) = std::env::var("POLYGON_RPC_URL") {
+        client.set_rpc_url(rpc);
+    }
 
     client.setup_approvals().await?.wait().await?;
     println!("Done. You can now trade gaslessly.");

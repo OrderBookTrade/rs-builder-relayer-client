@@ -80,7 +80,9 @@ async fn main() -> anyhow::Result<()> {
             RelayerTxType::Safe
         });
 
-    let client = RelayClient::new(137, wallet.clone(), auth, tx_type).await?;
+    let mut client = RelayClient::new(137, wallet.clone(), auth, tx_type).await?;
+    // Use on-chain nonce to avoid relayer API returning stale nonce (GS026 fix)
+    client.set_rpc_url(rpc_url.clone());
 
     // Direct executor for on-chain fallback when relayer returns 429
     let direct = match tx_type {
