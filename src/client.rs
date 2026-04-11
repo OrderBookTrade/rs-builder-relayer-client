@@ -17,7 +17,7 @@ use tracing::{debug, info, warn};
 ///
 /// A single redeemPositions uses ~100-150K gas. Set low to stay within
 /// the relayer bot's budget. The Polymarket frontend uses ~150K.
-const DEFAULT_PROXY_GAS_LIMIT: u64 = 150_000;
+const DEFAULT_PROXY_GAS_LIMIT: u64 = 200_000;
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_POLL_ATTEMPTS: u32 = 100;
 
