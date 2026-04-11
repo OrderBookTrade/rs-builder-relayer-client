@@ -242,15 +242,7 @@ impl RelayClient {
         debug!(raw_response = %text, "Relayer get_transaction response");
 
         let data = parse_relayer_response(&text)?;
-        let state = match data.state.to_uppercase().as_str() {
-            "NEW" => TxState::New,
-            "EXECUTED" => TxState::Executed,
-            "MINED" => TxState::Mined,
-            "CONFIRMED" => TxState::Confirmed,
-            "FAILED" => TxState::Failed,
-            "INVALID" => TxState::Invalid,
-            _ => TxState::New,
-        };
+        let state = parse_tx_state(&data.state);
         Ok(TxResult {
             state,
             tx_hash: data.transaction_hash.or(data.hash),
@@ -587,4 +579,27 @@ fn parse_relayer_value(value: &serde_json::Value) -> Result<RelayerTransactionRe
     Err(RelayerError::Other(format!(
         "Value is not a valid relayer response: {}", value
     )))
+}
+
+/// Parse a transaction state string from the relayer.
+///
+/// Handles both formats:
+///   - Plain: "NEW", "MINED", "CONFIRMED", "FAILED", "INVALID"
+///   - Prefixed: "STATE_NEW", "STATE_MINED", "STATE_CONFIRMED", etc.
+fn parse_tx_state(s: &str) -> TxState {
+    // Normalize: uppercase + strip "STATE_" prefix
+    let normalized = s.to_uppercase();
+    let key = normalized.strip_prefix("STATE_").unwrap_or(&normalized);
+    match key {
+        "NEW" => TxState::New,
+        "EXECUTED" => TxState::Executed,
+        "MINED" => TxState::Mined,
+        "CONFIRMED" => TxState::Confirmed,
+        "FAILED" => TxState::Failed,
+        "INVALID" => TxState::Invalid,
+        _ => {
+            warn!(raw_state = s, "Unknown transaction state, treating as New");
+            TxState::New
+        }
+    }
 }
