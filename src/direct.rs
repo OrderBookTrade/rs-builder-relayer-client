@@ -239,7 +239,7 @@ impl DirectExecutor {
 
         // Encode as proxy((uint8,address,uint256,bytes)[]) with a single call
         let call_tuple = Token::Tuple(vec![
-            Token::Uint(U256::zero()), // typeCode: 0 = Call
+            Token::Uint(U256::one()), // typeCode: 1 = Call (Polymarket proxy convention)
             Token::Address(target),
             Token::Uint(value),
             Token::Bytes(inner_calldata),

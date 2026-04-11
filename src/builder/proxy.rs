@@ -26,7 +26,7 @@ pub fn encode_proxy_calls(txs: &[Transaction]) -> Result<Vec<u8>> {
             .map_err(|e| RelayerError::Abi(format!("Invalid value: {e}")))?;
 
         call_tuples.push(Token::Tuple(vec![
-            Token::Uint(U256::zero()), // typeCode: 0 = Call
+            Token::Uint(U256::one()), // typeCode: 1 = Call (Polymarket proxy convention)
             Token::Address(to),
             Token::Uint(value),
             Token::Bytes(data),

@@ -9,7 +9,15 @@ use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, info, warn};
 
-const DEFAULT_GAS_LIMIT: u64 = 10_000_000;
+/// Gas limit for Proxy transactions via Relay Hub.
+///
+/// The Relay Hub requires `gasleft() >= gasLimit` before calling the inner
+/// function. The relayer bot has a fixed gas budget per transaction (~200-300K).
+/// Setting this too high causes "Not enough gasleft()" reverts.
+///
+/// A single redeemPositions uses ~100-150K gas. Set low to stay within
+/// the relayer bot's budget. The Polymarket frontend uses ~150K.
+const DEFAULT_PROXY_GAS_LIMIT: u64 = 150_000;
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_POLL_ATTEMPTS: u32 = 100;
 
@@ -380,7 +388,7 @@ impl RelayClient {
             self.signer.address(),
             txs,
             &relay_payload,
-            DEFAULT_GAS_LIMIT,
+            DEFAULT_PROXY_GAS_LIMIT,
         )
         .await?;
 
@@ -628,7 +636,7 @@ fn extract_error_from_response(text: &str) -> Option<String> {
     };
 
     // Try common error field names
-    for key in &["error", "reason", "failureReason", "revertReason", "message", "statusMessage"] {
+    for key in &["errorMsg", "error", "reason", "failureReason", "revertReason", "message", "statusMessage"] {
         if let Some(v) = obj.get(key) {
             let s = if let Some(s) = v.as_str() {
                 s.to_string()
