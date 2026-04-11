@@ -243,11 +243,19 @@ impl RelayClient {
 
         let data = parse_relayer_response(&text)?;
         let state = parse_tx_state(&data.state);
+
+        // Extract error details from the raw response for failed transactions
+        let error = if state == TxState::Failed || state == TxState::Invalid {
+            extract_error_from_response(&text)
+        } else {
+            None
+        };
+
         Ok(TxResult {
             state,
             tx_hash: data.transaction_hash.or(data.hash),
             proxy_address: None,
-            error: None,
+            error,
         })
     }
 
@@ -438,16 +446,18 @@ impl RelayClient {
             debug!(attempt, state = ?result.state, tx_id, "Polling transaction");
 
             if result.state.is_terminal() {
+                let tx_hash_str = result.tx_hash.as_deref().unwrap_or("no hash");
+                let error_str = result.error.as_deref().unwrap_or("no details");
                 if result.state == TxState::Failed {
                     return Err(RelayerError::TransactionFailed(format!(
-                        "Transaction {} failed",
-                        tx_id
+                        "Transaction {} failed | tx: {} | reason: {}",
+                        tx_id, tx_hash_str, error_str
                     )));
                 }
                 if result.state == TxState::Invalid {
                     return Err(RelayerError::TransactionInvalid(format!(
-                        "Transaction {} rejected",
-                        tx_id
+                        "Transaction {} rejected | tx: {} | reason: {}",
+                        tx_id, tx_hash_str, error_str
                     )));
                 }
                 return Ok(result);
@@ -602,4 +612,47 @@ fn parse_tx_state(s: &str) -> TxState {
             TxState::New
         }
     }
+}
+
+/// Extract error/reason from a raw relayer response JSON.
+///
+/// Looks for common error fields in the response or its array wrapper.
+fn extract_error_from_response(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+
+    // If it's an array, look inside the first element
+    let obj = if let Some(first) = value.as_array().and_then(|a| a.first()) {
+        first
+    } else {
+        &value
+    };
+
+    // Try common error field names
+    for key in &["error", "reason", "failureReason", "revertReason", "message", "statusMessage"] {
+        if let Some(v) = obj.get(key) {
+            let s = if let Some(s) = v.as_str() {
+                s.to_string()
+            } else {
+                v.to_string()
+            };
+            if !s.is_empty() && s != "\"\"" && s != "null" {
+                return Some(s);
+            }
+        }
+    }
+
+    // Try nested: derivedMetadata.error, etc.
+    if let Some(meta) = obj.get("derivedMetadata") {
+        for key in &["error", "reason", "revertReason"] {
+            if let Some(v) = meta.get(key) {
+                if let Some(s) = v.as_str() {
+                    if !s.is_empty() {
+                        return Some(s.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
