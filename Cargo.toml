@@ -50,3 +50,15 @@ path = "examples/redeem_all.rs"
 [[example]]
 name = "split_merge"
 path = "examples/split_merge.rs"
+
+[[example]]
+name = "redeem_magic"
+path = "examples/redeem_magic.rs"
+
+[[example]]
+name = "diagnose_gs026"
+path = "examples/diagnose_gs026.rs"
+
+[[example]]
+name = "diagnose_nonce"
+path = "examples/diagnose_nonce.rs"

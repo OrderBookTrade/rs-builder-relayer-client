@@ -12,19 +12,43 @@ pub struct Transaction {
 }
 
 /// Wallet type for relayed transactions.
+///
+/// Maps to Polymarket's `signature_type` values:
+///   0 = EOA (direct wallet, no abstraction)
+///   1 = POLY_PROXY (magic.link proxy wallet)
+///   2 = POLY_GNOSIS_SAFE (Gnosis Safe wallet)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum RelayerTxType {
-    /// Gnosis Safe wallet — must call deploy() before first tx.
-    Safe,
-    /// Proxy wallet — auto-deploys on first tx.
-    Proxy,
+    /// EOA wallet — direct signing, no wallet abstraction (signature_type=0).
+    Eoa = 0,
+    /// Proxy wallet — auto-deploys on first tx (signature_type=1, e.g. magic.link).
+    Proxy = 1,
+    /// Gnosis Safe wallet — must call deploy() before first tx (signature_type=2).
+    Safe = 2,
 }
 
 impl RelayerTxType {
     pub fn as_str(&self) -> &'static str {
         match self {
-            RelayerTxType::Safe => "SAFE",
+            RelayerTxType::Eoa => "EOA",
             RelayerTxType::Proxy => "PROXY",
+            RelayerTxType::Safe => "SAFE",
+        }
+    }
+
+    /// The numeric signature_type used by the Polymarket API.
+    pub fn signature_type(&self) -> u8 {
+        *self as u8
+    }
+
+    /// Parse from Polymarket's numeric signature_type.
+    pub fn from_signature_type(sig_type: u8) -> Option<Self> {
+        match sig_type {
+            0 => Some(RelayerTxType::Eoa),
+            1 => Some(RelayerTxType::Proxy),
+            2 => Some(RelayerTxType::Safe),
+            _ => None,
         }
     }
 }

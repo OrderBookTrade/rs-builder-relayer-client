@@ -1,11 +1,19 @@
-//! Direct on-chain execution via Gnosis Safe — fallback when relayer quota is exhausted.
+//! Direct on-chain execution — fallback when relayer quota is exhausted.
 //!
-//! Flow (matches the Python script's `redeem_direct`):
+//! Supports two wallet types:
+//! - **Safe** (signature_type=2): execTransaction via Gnosis Safe
+//! - **Proxy** (signature_type=1): direct call to proxy wallet (magic.link)
+//!
+//! Safe flow:
 //! 1. Read Safe nonce via `nonce()` view call
 //! 2. Get Safe transaction hash via `getTransactionHash()` on-chain call
 //! 3. ECDSA-sign the raw hash (no eth_sign prefix)
 //! 4. Pack signature r + s + v (v = 27 or 28)
 //! 5. Call `execTransaction` on the Safe
+//!
+//! Proxy flow:
+//! 1. Encode calls as proxy((uint8,address,uint256,bytes)[])
+//! 2. Send directly from EOA to proxy wallet address
 
 use ethers::abi::{encode, Token};
 use ethers::middleware::SignerMiddleware;
@@ -16,9 +24,9 @@ use ethers::types::{
 };
 use ethers::utils::keccak256;
 
-use crate::builder::derive::derive_safe_address;
+use crate::builder::derive;
 use crate::error::{RelayerError, Result};
-use crate::types::Transaction;
+use crate::types::{RelayerTxType, Transaction};
 
 const DEFAULT_GAS_LIMIT: u64 = 500_000;
 
@@ -32,20 +40,42 @@ pub struct DirectTxResult {
     pub block_number: u64,
 }
 
-/// Executor for direct on-chain Safe transactions (no relayer).
+/// Executor for direct on-chain transactions (no relayer).
+///
+/// Supports both Safe and Proxy wallet types.
 pub struct DirectExecutor {
     provider: SignerMiddleware<Provider<Http>, LocalWallet>,
     signer_address: Address,
-    safe_address: Address,
+    wallet_address: Address,
+    wallet_type: RelayerTxType,
     #[allow(dead_code)]
     chain_id: u64,
 }
 
 impl DirectExecutor {
-    /// Create a new DirectExecutor.
+    /// Create a new DirectExecutor for a **Safe** wallet (backward compatible).
     pub fn new(rpc_url: &str, signer: LocalWallet, chain_id: u64) -> Result<Self> {
+        Self::with_type(rpc_url, signer, chain_id, RelayerTxType::Safe)
+    }
+
+    /// Create a new DirectExecutor for a **Proxy** wallet.
+    pub fn new_proxy(rpc_url: &str, signer: LocalWallet, chain_id: u64) -> Result<Self> {
+        Self::with_type(rpc_url, signer, chain_id, RelayerTxType::Proxy)
+    }
+
+    /// Create a DirectExecutor with explicit wallet type.
+    pub fn with_type(
+        rpc_url: &str,
+        signer: LocalWallet,
+        chain_id: u64,
+        wallet_type: RelayerTxType,
+    ) -> Result<Self> {
         let signer_address = signer.address();
-        let safe_address = derive_safe_address(signer_address)?;
+        let wallet_address = match wallet_type {
+            RelayerTxType::Eoa => signer_address,
+            RelayerTxType::Safe => derive::derive_safe_address(signer_address)?,
+            RelayerTxType::Proxy => derive::derive_proxy_address(signer_address)?,
+        };
 
         let provider = Provider::<Http>::try_from(rpc_url)
             .map_err(|e| RelayerError::Other(format!("Invalid RPC URL: {e}")))?;
@@ -54,17 +84,50 @@ impl DirectExecutor {
         Ok(Self {
             provider,
             signer_address,
-            safe_address,
+            wallet_address,
+            wallet_type,
             chain_id,
         })
     }
 
+    /// Create a DirectExecutor for a Proxy wallet with an explicit proxy address
+    /// (instead of deriving it from the signer).
+    pub fn new_proxy_with_address(
+        rpc_url: &str,
+        signer: LocalWallet,
+        chain_id: u64,
+        proxy_address: Address,
+    ) -> Result<Self> {
+        let signer_address = signer.address();
+        let provider = Provider::<Http>::try_from(rpc_url)
+            .map_err(|e| RelayerError::Other(format!("Invalid RPC URL: {e}")))?;
+        let provider = SignerMiddleware::new(provider, signer.with_chain_id(chain_id));
+
+        Ok(Self {
+            provider,
+            signer_address,
+            wallet_address: proxy_address,
+            wallet_type: RelayerTxType::Proxy,
+            chain_id,
+        })
+    }
+
+    /// Get the wallet address (Safe or Proxy).
+    pub fn wallet_address(&self) -> Address {
+        self.wallet_address
+    }
+
+    /// Backward-compatible alias for `wallet_address()`.
     pub fn safe_address(&self) -> Address {
-        self.safe_address
+        self.wallet_address
     }
 
     pub fn signer_address(&self) -> Address {
         self.signer_address
+    }
+
+    pub fn wallet_type(&self) -> RelayerTxType {
+        self.wallet_type
     }
 
     /// Get MATIC balance of the EOA (for gas).
@@ -78,8 +141,40 @@ impl DirectExecutor {
         Ok(matic)
     }
 
-    /// Execute a transaction directly through the Gnosis Safe.
+    /// Execute a transaction directly on-chain.
+    ///
+    /// Routes to Safe or Proxy execution based on `wallet_type`.
     pub async fn execute(&self, tx: &Transaction) -> Result<DirectTxResult> {
+        match self.wallet_type {
+            RelayerTxType::Eoa => self.execute_eoa(tx).await,
+            RelayerTxType::Safe => self.execute_safe(tx).await,
+            RelayerTxType::Proxy => self.execute_proxy(tx).await,
+        }
+    }
+
+    // ── EOA execution ──────────────────────────────────────────────────
+
+    /// Execute a transaction directly from the EOA (signature_type=0).
+    ///
+    /// Simplest path: just send the calldata to the target address.
+    async fn execute_eoa(&self, tx: &Transaction) -> Result<DirectTxResult> {
+        let target: Address = tx
+            .to
+            .parse()
+            .map_err(|e: <Address as std::str::FromStr>::Err| {
+                RelayerError::InvalidAddress(e.to_string())
+            })?;
+        let calldata = hex::decode(tx.data.strip_prefix("0x").unwrap_or(&tx.data))
+            .map_err(|e| RelayerError::Abi(format!("Invalid calldata hex: {e}")))?;
+
+        tracing::debug!(target = ?target, "Executing direct EOA call");
+        self.send_raw_tx(target, calldata).await
+    }
+
+    // ── Safe execution ─────────────────────────────────────────────────
+
+    /// Execute a transaction directly through the Gnosis Safe.
+    async fn execute_safe(&self, tx: &Transaction) -> Result<DirectTxResult> {
         let target: Address = tx
             .to
             .parse()
@@ -120,7 +215,55 @@ impl DirectExecutor {
         let exec_calldata =
             self.encode_exec_transaction(target, &inner_calldata, &packed_sig);
 
-        // 6. Send transaction
+        // 6. Send transaction to Safe
+        self.send_raw_tx(self.wallet_address, exec_calldata).await
+    }
+
+    // ── Proxy execution ────────────────────────────────────────────────
+
+    /// Execute a transaction directly through a Proxy wallet.
+    ///
+    /// For proxy wallets (signature_type=1, e.g. magic.link), the EOA is the
+    /// owner of the proxy and can call the proxy's `proxy()` function directly.
+    async fn execute_proxy(&self, tx: &Transaction) -> Result<DirectTxResult> {
+        let target: Address = tx
+            .to
+            .parse()
+            .map_err(|e: <Address as std::str::FromStr>::Err| {
+                RelayerError::InvalidAddress(e.to_string())
+            })?;
+        let inner_calldata = hex::decode(tx.data.strip_prefix("0x").unwrap_or(&tx.data))
+            .map_err(|e| RelayerError::Abi(format!("Invalid calldata hex: {e}")))?;
+        let value = U256::from_dec_str(&tx.value)
+            .map_err(|e| RelayerError::Abi(format!("Invalid value: {e}")))?;
+
+        // Encode as proxy((uint8,address,uint256,bytes)[]) with a single call
+        let call_tuple = Token::Tuple(vec![
+            Token::Uint(U256::one()), // typeCode: 1 = Call (Polymarket proxy convention)
+            Token::Address(target),
+            Token::Uint(value),
+            Token::Bytes(inner_calldata),
+        ]);
+
+        let selector = &keccak256(b"proxy((uint8,address,uint256,bytes)[])")[..4];
+        let encoded = encode(&[Token::Array(vec![call_tuple])]);
+        let mut calldata = selector.to_vec();
+        calldata.extend_from_slice(&encoded);
+
+        tracing::debug!(
+            proxy_address = ?self.wallet_address,
+            target = ?target,
+            "Executing direct proxy call"
+        );
+
+        // Send directly to the proxy wallet
+        self.send_raw_tx(self.wallet_address, calldata).await
+    }
+
+    // ── Common send logic ──────────────────────────────────────────────
+
+    /// Send a raw transaction and wait for receipt.
+    async fn send_raw_tx(&self, to: Address, calldata: Vec<u8>) -> Result<DirectTxResult> {
         let gas_price = self
             .provider
             .get_gas_price()
@@ -128,8 +271,8 @@ impl DirectExecutor {
             .map_err(|e| RelayerError::Other(format!("Failed to get gas price: {e}")))?;
 
         let tx_request = Eip1559TransactionRequest::new()
-            .to(self.safe_address)
-            .data(exec_calldata)
+            .to(to)
+            .data(calldata)
             .gas(DEFAULT_GAS_LIMIT)
             .max_fee_per_gas(gas_price * 3 / 2)
             .max_priority_fee_per_gas(U256::from(30_000_000_000u64)); // 30 gwei
@@ -172,22 +315,35 @@ impl DirectExecutor {
         })
     }
 
-    // ── On-chain calls ──────────────────────────────────────────────────
+    // ── Safe on-chain calls ────────────────────────────────────────────
 
     /// Read the Safe nonce via eth_call to `nonce()`.
     async fn read_safe_nonce(&self) -> Result<u64> {
         let selector = &keccak256(b"nonce()")[..4];
-        let result = self.eth_call_safe(selector).await?;
+        let result = self.eth_call(self.wallet_address, selector).await.map_err(|e| {
+            RelayerError::Other(format!(
+                "Failed to read Safe nonce from {:?}: {}. \
+                 Check that the Safe is deployed and the RPC URL is reachable.",
+                self.wallet_address, e
+            ))
+        })?;
+        if result.is_empty() {
+            return Err(RelayerError::Other(format!(
+                "Empty nonce response from Safe {:?} — wallet may not be deployed",
+                self.wallet_address
+            )));
+        }
         if result.len() < 32 {
-            return Err(RelayerError::Other("Invalid nonce response".to_string()));
+            return Err(RelayerError::Other(format!(
+                "Invalid nonce response ({} bytes, expected 32) from Safe {:?}",
+                result.len(),
+                self.wallet_address
+            )));
         }
         Ok(U256::from_big_endian(&result[..32]).as_u64())
     }
 
     /// Get the Safe tx hash via eth_call to `getTransactionHash(...)`.
-    ///
-    /// This is the authoritative hash the Safe uses for signature verification.
-    /// Matches Python's `create_struct_hash()` which calls the same view function.
     async fn get_transaction_hash_onchain(
         &self,
         to: Address,
@@ -214,7 +370,7 @@ impl DirectExecutor {
         let mut calldata = selector.to_vec();
         calldata.extend_from_slice(&encoded_args);
 
-        let result = self.eth_call_safe(&calldata).await?;
+        let result = self.eth_call(self.wallet_address, &calldata).await?;
         if result.len() < 32 {
             return Err(RelayerError::Other(
                 "Invalid getTransactionHash response".to_string(),
@@ -223,22 +379,30 @@ impl DirectExecutor {
         Ok(H256::from_slice(&result[..32]))
     }
 
-    /// Helper: eth_call to the Safe contract.
-    async fn eth_call_safe(&self, calldata: &[u8]) -> Result<Bytes> {
+    /// Helper: eth_call to any contract address.
+    async fn eth_call(&self, to: Address, calldata: &[u8]) -> Result<Bytes> {
+        let selector_hex = if calldata.len() >= 4 {
+            format!("0x{}", hex::encode(&calldata[..4]))
+        } else {
+            "empty".to_string()
+        };
         self.provider
             .call(
                 &ethers::types::transaction::eip2718::TypedTransaction::Eip1559(
                     Eip1559TransactionRequest::new()
-                        .to(self.safe_address)
+                        .to(to)
                         .data(Bytes::from(calldata.to_vec())),
                 ),
                 None,
             )
             .await
-            .map_err(|e| RelayerError::Other(format!("eth_call failed: {e}")))
+            .map_err(|e| RelayerError::Other(format!(
+                "eth_call to {:?} (selector {}) failed: {e}",
+                to, selector_hex
+            )))
     }
 
-    /// Encode execTransaction calldata.
+    /// Encode execTransaction calldata for Safe.
     fn encode_exec_transaction(
         &self,
         to: Address,
