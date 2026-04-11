@@ -122,7 +122,9 @@ async fn main() -> anyhow::Result<()> {
 | Deploy Safe wallet | `client.deploy()` |
 | Split USDC into tokens | `operations::split_regular(cid, &[1, 2], amount)` |
 | Merge tokens back to USDC | `operations::merge_regular(cid, &[1, 2], amount)` |
-| Batch multiple ops | `client.execute(vec![tx1, tx2], "desc")` |
+| Execute single/multiple ops | `client.execute(vec![tx1], "desc")` |
+| Execute true multi-send batch | `client.execute_batch(vec![tx1, tx2], "desc")` |
+| Execute chunks sequentially | `client.execute_sequential(vec![vec![tx1], vec![tx2]], None, None)` |
 | Direct on-chain fallback | `DirectExecutor::new(rpc_url, wallet, 137)?` |
 
 ## Auth
@@ -164,6 +166,17 @@ match client.execute(vec![tx], "Redeem").await {
     other => { /* handle normally */ }
 }
 ```
+
+## Batching & Execution Strategies
+
+Depending on whether you use `RelayerTxType::Safe` or `RelayerTxType::Proxy`, the SDK provides several execution models:
+
+* **`client.execute` / `client.execute_batch`**:
+  * **Safe Wallets**: Uses official Gnosis `MultiSend` contracts. Multiple operations are packed tightly into a single transaction. Safe is highly durable and recommended for heavy batching (> 2 operations).
+  * **Proxy Wallets**: While the OpenGSN proxy supports a `(uint8, address, uint256, bytes)[]` array structure, the Polymarket relayer bot imposes strict total-transaction gas limits top-level. **Batching more than 2 operations with Proxy wallets is highly discouraged** and might hit silent `relay hub: internal transaction failure` errors due to gas starvation. The SDK dynamically scales requests up to a hard cap of 400K gas. 
+
+* **`client.execute_sequential`**: 
+  Designed purely to circumvent Proxy Relayer bottlenecks when you have e.g. 10 positions to redeem. It executes batches step-by-step, patiently awaiting `STATE_CONFIRMED` to prevent nonce collisions and OpenGSN RelayHub deadlocks across Gelato's relayer pools.
 
 ## Examples
 
