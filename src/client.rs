@@ -337,6 +337,95 @@ impl RelayClient {
         })
     }
 
+    /// Execute multiple groups of transactions sequentially, waiting for each
+    /// to confirm before submitting the next.
+    ///
+    /// This avoids nonce collisions when the relay bot (Gelato) cannot handle
+    /// back-to-back requests for the same proxy wallet.
+    ///
+    /// # Arguments
+    /// * `batches` - Each inner `Vec<Transaction>` is submitted as one relay request.
+    /// * `delay` - Wait time between confirmed batches (default 5s if `None`).
+    /// * `on_progress` - Optional callback `(completed, total)` after each batch confirms.
+    ///
+    /// Returns a vec of `TxResult`, one per batch (in order).
+    pub async fn execute_sequential(
+        &self,
+        batches: Vec<Vec<Transaction>>,
+        delay: Option<Duration>,
+        on_progress: Option<&dyn Fn(usize, usize)>,
+    ) -> Result<Vec<TxResult>> {
+        let delay = delay.unwrap_or(Duration::from_secs(5));
+        let total = batches.len();
+        let mut results = Vec::with_capacity(total);
+
+        for (i, txs) in batches.into_iter().enumerate() {
+            let desc = format!("Batch {}/{}", i + 1, total);
+            info!(batch = i + 1, total, "Submitting sequential batch");
+
+            let handle = self.execute(txs, &desc).await?;
+            let result = handle.wait().await?;
+            results.push(result);
+
+            if let Some(cb) = on_progress {
+                cb(i + 1, total);
+            }
+
+            // Delay between batches (skip after the last one)
+            if i + 1 < total {
+                debug!(delay_secs = delay.as_secs(), "Waiting between batches");
+                sleep(delay).await;
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Execute multiple transactions as a single batched relay request.
+    ///
+    /// All transactions share one nonce and one relay call, completely avoiding
+    /// nonce collisions. More gas-efficient than sequential execution.
+    ///
+    /// For Proxy wallets, the gas limit scales with the number of transactions:
+    ///   `gas_limit = 150_000 + (extra_txs * 80_000)`, capped at 400_000.
+    ///
+    /// For Safe wallets, multiple transactions are packed via multiSend
+    /// (already handled by `build_safe_request`).
+    pub async fn execute_batch(
+        &self,
+        txs: Vec<Transaction>,
+        description: &str,
+    ) -> Result<TxResult> {
+        if txs.is_empty() {
+            return Err(RelayerError::Other("No transactions to batch".to_string()));
+        }
+
+        info!(count = txs.len(), description, "Submitting batch transaction");
+
+        let request = match self.tx_type {
+            RelayerTxType::Eoa => {
+                return Err(RelayerError::Other(
+                    "EOA wallets cannot use the gasless relayer".to_string(),
+                ));
+            }
+            RelayerTxType::Safe => {
+                // Safe already supports multisend natively
+                self.build_safe_request(&txs, description).await?
+            }
+            RelayerTxType::Proxy => {
+                // build_proxy_request now scales gas limit internally based on tx count.
+                self.build_proxy_request(&txs, description).await?
+            }
+        };
+
+        let response = self.submit(request).await?;
+        info!(tx_id = %response.transaction_id, description, "Batch submitted");
+
+        self.wait_for_tx(&response.transaction_id).await
+    }
+
+
+
     /// Build a Safe transaction request with full EIP-712 signing.
     async fn build_safe_request(
         &self,
@@ -374,7 +463,7 @@ impl RelayClient {
         })
     }
 
-    /// Build a Proxy transaction request with keccak256 signing.
+    /// Build a Proxy transaction request with dynamic gas limit scaling.
     async fn build_proxy_request(
         &self,
         txs: &[Transaction],
@@ -383,12 +472,17 @@ impl RelayClient {
         let proxy_address = self.wallet_address()?;
         let relay_payload = self.get_relay_payload().await?;
 
+        // Scale gas limit for multiple operations
+        let extra = txs.len().saturating_sub(1) as u64;
+        let gas_limit = (DEFAULT_PROXY_GAS_LIMIT + extra * 80_000).min(400_000);
+        debug!(gas_limit, tx_count = txs.len(), "Dynamic proxy gas limit");
+
         let (data, signature, sig_params) = proxy::build_proxy_transaction(
             self.signer.as_ref(),
             self.signer.address(),
             txs,
             &relay_payload,
-            DEFAULT_PROXY_GAS_LIMIT,
+            gas_limit,
         )
         .await?;
 
