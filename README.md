@@ -132,13 +132,25 @@ AuthMethod::relayer_key("api_key", "wallet_address")
 
 ## Direct Fallback (when relayer returns 429)
 
-> **Note:** The default `https://polygon-rpc.com/` RPC often experiences TLS handshake EOF issues. For reliable fallback execution, it is highly recommended to provide a `POLYGON_RPC_URL` from providers like Alchemy, QuickNode, or LlamaRPC.
+> **Warning:** Do **not** use `https://polygon-rpc.com/` as your RPC URL — it frequently causes TLS handshake EOF errors and connection resets, especially under load. Use a dedicated provider instead:
+> - [Alchemy](https://www.alchemy.com/) (recommended): `https://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY`
+> - [QuickNode](https://www.quicknode.com/): `https://YOUR_ENDPOINT.quiknode.pro/YOUR_KEY/`
+> - [LlamaRPC](https://llamarpc.com/): `https://polygon.llamarpc.com`
 
 ```rust
 use polymarket_relayer::{DirectExecutor, RelayerError};
 
-let rpc_url = std::env::var("POLYGON_RPC_URL").unwrap_or_else(|_| "https://polygon-rpc.com".to_string());
+let rpc_url = std::env::var("POLYGON_RPC_URL")
+    .expect("Set POLYGON_RPC_URL to an Alchemy/QuickNode endpoint");
+
+// Safe wallet (signature_type=2, default)
 let direct = DirectExecutor::new(&rpc_url, wallet, 137)?;
+
+// Proxy wallet (signature_type=1, e.g. magic.link)
+let direct = DirectExecutor::new_proxy(&rpc_url, wallet, 137)?;
+
+// Proxy with explicit address (when derived address differs)
+let direct = DirectExecutor::new_proxy_with_address(&rpc_url, wallet, 137, proxy_addr)?;
 
 match client.execute(vec![tx], "Redeem").await {
     Err(RelayerError::QuotaExhausted) => {
@@ -158,6 +170,7 @@ cargo run --example redeem_all -- --execute     # actually redeem
 cargo run --example setup_wallet                # deploy Safe + approvals
 cargo run --example redeem_single               # redeem one position
 cargo run --example split_merge                 # split/merge demo
+cargo run --example redeem_magic                # magic.link proxy wallet redeem
 ```
 
 ## References

@@ -7,7 +7,7 @@ use ethers::signers::{LocalWallet, Signer};
 use reqwest::Client;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 const DEFAULT_GAS_LIMIT: u64 = 10_000_000;
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -62,9 +62,10 @@ impl RelayClient {
         self.signer.address()
     }
 
-    /// Get the derived wallet address (Safe or Proxy).
+    /// Get the derived wallet address (Safe, Proxy, or EOA).
     pub fn wallet_address(&self) -> Result<ethers::types::Address> {
         match self.tx_type {
+            RelayerTxType::Eoa => Ok(self.signer.address()),
             RelayerTxType::Safe => derive::derive_safe_address(self.signer.address()),
             RelayerTxType::Proxy => derive::derive_proxy_address(self.signer.address()),
         }
@@ -144,7 +145,9 @@ impl RelayClient {
             return Err(RelayerError::Api { status, message: body });
         }
         let text = resp.text().await?;
-        let data: RelayerTransactionResponse = serde_json::from_str(&text).map_err(|e| RelayerError::Other(format!("Tx Parse Error on {}: {}", text, e)))?;
+        debug!(raw_response = %text, "Relayer get_transaction response");
+
+        let data = parse_relayer_response(&text)?;
         let state = match data.state.to_uppercase().as_str() {
             "NEW" => TxState::New,
             "EXECUTED" => TxState::Executed,
@@ -214,6 +217,11 @@ impl RelayClient {
         }
 
         let request = match self.tx_type {
+            RelayerTxType::Eoa => {
+                return Err(RelayerError::Other(
+                    "EOA wallets cannot use the gasless relayer — send transactions directly".to_string(),
+                ));
+            }
             RelayerTxType::Safe => self.build_safe_request(&txs, description).await?,
             RelayerTxType::Proxy => self.build_proxy_request(&txs, description).await?,
         };
@@ -331,7 +339,9 @@ impl RelayClient {
         }
 
         let text = resp.text().await?;
-        Ok(serde_json::from_str(&text).map_err(|e| RelayerError::Other(format!("Submit Parse Error on {}: {}", text, e)))?)
+        debug!(raw_response = %text, "Relayer submit response");
+
+        parse_relayer_response(&text)
     }
 
     /// Poll for transaction confirmation.
@@ -409,4 +419,59 @@ impl TransactionResponseHandle {
     pub fn id(&self) -> &str {
         &self.tx_id
     }
+}
+
+/// Parse a relayer response that may be either:
+///   - A flat `RelayerTransactionResponse` JSON object
+///   - A string containing JSON
+///   - A wrapper object with a nested transaction (e.g., `{"data": {...}}`)
+fn parse_relayer_response(text: &str) -> Result<RelayerTransactionResponse> {
+    // 1. Try direct deserialization
+    if let Ok(resp) = serde_json::from_str::<RelayerTransactionResponse>(text) {
+        return Ok(resp);
+    }
+
+    // 2. Try as a JSON value and extract from known wrapper keys
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+        // Try common wrapper patterns: {"data": {...}}, {"result": {...}}, {"transaction": {...}}
+        for key in &["data", "result", "transaction"] {
+            if let Some(inner) = value.get(key) {
+                if let Ok(resp) = serde_json::from_value::<RelayerTransactionResponse>(inner.clone()) {
+                    warn!(wrapper_key = key, "Relayer returned wrapped response");
+                    return Ok(resp);
+                }
+            }
+        }
+
+        // 3. Try extracting transactionId/transactionID from top-level (partial match)
+        let tx_id = value.get("transactionId")
+            .or_else(|| value.get("transactionID"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        if let Some(id) = tx_id {
+            let state = value.get("state")
+                .and_then(|v| v.as_str())
+                .unwrap_or("NEW")
+                .to_string();
+            let hash = value.get("hash")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let transaction_hash = value.get("transactionHash")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            warn!("Relayer response required manual field extraction");
+            return Ok(RelayerTransactionResponse {
+                transaction_id: id,
+                state,
+                hash,
+                transaction_hash,
+            });
+        }
+    }
+
+    Err(RelayerError::Other(format!(
+        "Failed to parse relayer response: {}", text
+    )))
 }

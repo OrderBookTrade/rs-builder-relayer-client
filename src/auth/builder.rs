@@ -23,6 +23,7 @@ pub fn build_hmac_signature(
     let decoded_secret = general_purpose::STANDARD
         .decode(secret)
         .or_else(|_| general_purpose::URL_SAFE.decode(secret))
+        .or_else(|_| general_purpose::URL_SAFE_NO_PAD.decode(secret))
         .map_err(|e| RelayerError::AuthError(format!("Failed to decode base64 secret: {e}")))?;
 
     let message = format!("{}{}{}{}", timestamp, method, path, body);

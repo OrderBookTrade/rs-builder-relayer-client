@@ -17,6 +17,7 @@
 //!   POLYGON_RPC_URL=https://...         # (optional, for direct fallback)
 
 use ethers::signers::LocalWallet;
+use ethers::types::Address;
 use polymarket_client_sdk::data::Client as DataClient;
 use polymarket_client_sdk::data::types::request::PositionsRequest;
 use polymarket_relayer::{
@@ -67,14 +68,33 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let wallet: LocalWallet = private_key.parse()?;
-    let client = RelayClient::new(137, wallet.clone(), auth, RelayerTxType::Safe).await?;
+
+    // Wallet type from SIGNATURE_TYPE env var (0=EOA, 1=Proxy, 2=Safe, default=2)
+    let sig_type: u8 = env::var("SIGNATURE_TYPE")
+        .unwrap_or_else(|_| "2".to_string())
+        .parse()
+        .unwrap_or(2);
+    let tx_type = RelayerTxType::from_signature_type(sig_type)
+        .unwrap_or_else(|| {
+            eprintln!("Unknown SIGNATURE_TYPE={sig_type}, defaulting to Safe (2)");
+            RelayerTxType::Safe
+        });
+
+    let client = RelayClient::new(137, wallet.clone(), auth, tx_type).await?;
 
     // Direct executor for on-chain fallback when relayer returns 429
-    let direct = DirectExecutor::new(&rpc_url, wallet, 137)?;
+    let direct = match tx_type {
+        RelayerTxType::Proxy => {
+            // For proxy wallets, use the explicit address if provided
+            let proxy_addr: Address = wallet_address.parse()?;
+            DirectExecutor::new_proxy_with_address(&rpc_url, wallet, 137, proxy_addr)?
+        }
+        _ => DirectExecutor::with_type(&rpc_url, wallet, 137, tx_type)?,
+    };
     let matic_balance = direct.get_matic_balance().await.unwrap_or(0.0);
 
     println!("EOA:    {:?}", client.signer_address());
-    println!("Safe:   {:?}", client.wallet_address()?);
+    println!("Wallet: {:?} ({})", client.wallet_address()?, tx_type.as_str());
     println!("MATIC:  {:.4} (for direct fallback)", matic_balance);
 
     // ── 2. Fetch all positions via Polymarket Data API ──────────────────
